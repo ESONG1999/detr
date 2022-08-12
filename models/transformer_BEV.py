@@ -38,16 +38,21 @@ class Transformer(nn.Module):
 
         self.d_model = d_model
         self.nhead = nhead
-         
-        self.linear_b = nn.Linear(2, 100)
-        self.conv_b = nn.Conv1d(in_channels=1, out_channels=256,kernel_size=1)
+        
+        # self.linear_b = nn.Linear(2, 100)
+        # self.conv_b = nn.Conv1d(in_channels=1, out_channels=256,kernel_size=1)
+        # self.linear_Q = nn.Linear(6, 1)
+
+        self.head_embedding = nn.Linear(2, self.d_model)
+        self.feet_embedding = nn.Linear(2, self.d_model)
+        self.depth_embedding = nn.Linear(1, self.d_model)
 
     def _reset_parameters(self):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, src, mask, query_embed, pos_embed, query_B):
+    def forward(self, src, mask, query_embed, pos_embed, output_depth_bin, output_depth_delta, head_bev, feet_bev):
         # flatten NxCxHxW to HWxNxC
         bs, c, h, w = src.shape
         src = src.flatten(2).permute(2, 0, 1)
@@ -66,14 +71,31 @@ class Transformer(nn.Module):
         # query_embed = query_embed + b_coordinate
         
         # 6 * N * num_queries * hidden_dim to num_queries * N * hidden_dim * 6
-        query_B = query_B.permute(2, 1, 3, 0)
+        # query_B = query_B.permute(2, 1, 3, 0)
         # num_queries * N * hidden_dim * 6 to num_queries * N * hidden_dim * 1
-        query_B = self.linear_Q(query_B)
+        # query_B = self.linear_Q(query_B)
         # num_queries * N * hidden_dim * 1 to num_queries * N * 1 * hidden_dim
-        query_B = query_B.permute(0, 1, 3, 2)
+        # query_B = query_B.permute(0, 1, 3, 2)
         # num_queries * N * 1 * hidden_dim to num_queries * N * hidden_dim
-        query_B = query_embed.squeeze(2)
-        query_embed = query_embed + query_B
+        # query_B = query_embed.squeeze(2)
+        # query_embed = query_embed + query_B
+
+        depth_bin = torch.argmax(output_depth_bin, dim=2)
+        depth_bin = torch.unsqueeze(depth_bin, 2)
+        depth_raw = depth_bin * 10
+        depth = depth_raw + output_depth_delta
+        depth_query = self.depth_embedding(depth)
+
+        # B * num_queries * 2 to B * num_queries * 256
+        head_bev = self.head_embedding(head_bev)
+        feet_bev = self.feet_embedding(feet_bev)
+        # B * num_queries * 256 to num_queries * B * 256
+        head_bev = head_bev.permute(1, 0, 2)
+        feet_bev = feet_bev.permute(1, 0, 2)
+
+        bev_query = (head_bev + feet_bev) / 2
+        depth_query = depth_query.permute(1, 0, 2)
+        query_embed = query_embed + bev_query + depth_query
 
         tgt = torch.zeros_like(query_embed)
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)

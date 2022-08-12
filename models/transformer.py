@@ -39,8 +39,8 @@ class Transformer(nn.Module):
         self.d_model = d_model
         self.nhead = nhead
          
-        self.linear_b = nn.Linear(2, 100)
-        self.conv_b = nn.Conv1d(in_channels=1, out_channels=256,kernel_size=1)
+        # self.linear_b = nn.Linear(2, 100)
+        # self.conv_b = nn.Conv1d(in_channels=1, out_channels=256,kernel_size=1)
 
     def _reset_parameters(self):
         for p in self.parameters():
