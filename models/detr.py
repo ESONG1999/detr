@@ -39,6 +39,7 @@ class DETR(nn.Module):
         self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        self.query_embed_B = nn.Embedding(num_queries, hidden_dim)
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
         self.aux_loss = aux_loss
@@ -97,7 +98,7 @@ class DETR(nn.Module):
         # a = output_depth_bin + outputs_class
 
         # BEV stage
-        hs_B = self.transformer_BEV(self.input_proj(src), mask, self.query_embed.weight, pos[-1], output_depth_bin[-1], output_depth_delta[-1], head_bev[-1], feet_bev[-1])[0]
+        hs_B = self.transformer_BEV(self.input_proj(src), mask, self.query_embed_B.weight, pos[-1], output_depth_bin[-1], output_depth_delta[-1], head_bev[-1], feet_bev[-1])[0]
         outputs_bev = self.bev_embed(hs_B).sigmoid()
         outputs_dim = self.dim_embed(hs_B)
         outputs_angle = self.angle_embed(hs_B)
