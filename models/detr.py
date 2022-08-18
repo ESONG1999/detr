@@ -21,7 +21,7 @@ from .transformer_BEV import build_transformer_BEV
 
 class DETR(nn.Module):
     """ This is the DETR module that performs object detection """
-    def __init__(self, backbone, transformer, transformer_BEV, num_classes, num_queries, aux_loss=False):
+    def __init__(self, backbone, transformer, transformer_BEV, num_classes, num_queries, aux_loss=False, n_depth_bins = 10):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -39,14 +39,22 @@ class DETR(nn.Module):
         self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        self.query_embed_B = nn.Embedding(num_queries, hidden_dim)
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
         self.aux_loss = aux_loss
         self.bev_embed = MLP(hidden_dim, hidden_dim, 2, 2)
         self.angle_embed = MLP(hidden_dim, hidden_dim, 24, 2)
         self.dim_embed = MLP(hidden_dim, hidden_dim, 2, 2)
+        # depth predicted as => d_bin_id* bin_width + bin_width/2 + correction
+        # -bin_width/2 <= correction < bin_width/2
+        self.n_depth_bins = n_depth_bins
+        self.depth_delta =  nn.Linear(hidden_dim, 1) # regression for finding delta
+        self.depth_bin = nn.Linear(hidden_dim, self.n_depth_bins)
+        # self.calib_cam_to_bev = nn.Linear(2, 2)
 
-    def forward(self, samples: NestedTensor):
+
+    def forward(self, samples: NestedTensor, calib):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -67,27 +75,49 @@ class DETR(nn.Module):
 
         src, mask = features[-1].decompose()
         assert mask is not None
-        query_B = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]
-        print(query_B.size())
-        hs = self.transformer_BEV(self.input_proj(src), mask, self.query_embed.weight, pos[-1], query_B)[0]
-
+        hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]
+        # print(query_B.size())
+        # Depth and 2D detection part
+        output_depth_bin = F.softmax(self.depth_bin(hs), dim = 3)
+        output_depth_delta = torch.tanh(self.depth_delta(hs))/2
         outputs_class = self.class_embed(hs)
         outputs_coord = self.bbox_embed(hs).sigmoid()
-        outputs_bev = self.bev_embed(hs)
-        outputs_dim = self.dim_embed(hs)
-        outputs_angle = self.angle_embed(hs)
-        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1], 'pred_bev': outputs_bev[-1], 'pred_dim': outputs_dim[-1], 'pred_angle': outputs_angle[-1]}
+        
+        # head and feet part
+
+        mid_2d = outputs_coord[:, :, :, 0] * 1242
+        top_2d = (outputs_coord[:, :, :, 1] - outputs_coord[:, :, :, 3] / 2) * 375
+        down_2d = (outputs_coord[:, :, :, 1] + outputs_coord[:, :, :, 3] / 2) * 375
+        head_2d = torch.stack((mid_2d, top_2d), dim = 3)
+        feet_2d = torch.stack((mid_2d, down_2d), dim = 3)
+        # print(head_2d.size())
+        # print(feet_2d.size())
+        # head_bev = self.calib_cam_to_bev(head_2d).sigmoid()
+        # feet_bev = self.calib_cam_to_bev(feet_2d).sigmoid()
+
+        # print(output_depth_bin[-1].size())
+        # print(output_depth_delta[-1].size())
+        # print(outputs_coord[-1].size())
+        # a = output_depth_bin + outputs_class
+
+        # BEV stage
+        hs_B = self.transformer_BEV(self.input_proj(src), mask, self.query_embed_B.weight, pos[-1], output_depth_bin[-1], output_depth_delta[-1], head_2d[-1], feet_2d[-1], calib)[0]
+        outputs_bev = self.bev_embed(hs_B).sigmoid()
+        outputs_dim = self.dim_embed(hs_B)
+        outputs_angle = self.angle_embed(hs_B)
+
+        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1], 'pred_bev': outputs_bev[-1], 'pred_dim': outputs_dim[-1], 'pred_angle': outputs_angle[-1], 'pred_depth_bin': output_depth_bin[-1], 'pred_depth_delta': output_depth_delta[-1]}
         if self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord, outputs_bev, outputs_dim, outputs_angle)
+            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord, outputs_bev, outputs_dim, outputs_angle, output_depth_bin, output_depth_delta)
         return out
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_bev, outputs_dim, outputs_angle):
+    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_bev, outputs_dim, outputs_angle, output_depth_bin, output_depth_delta):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_boxes': b, 'pred_bev': c, 'pred_dim': d, 'pred_angle': e}
-                for a, b, c, d, e in zip(outputs_class[:-1], outputs_coord[:-1], outputs_bev[:-1], outputs_dim[:-1], outputs_angle[:-1])]
+        return [{'pred_logits': a, 'pred_boxes': b, 'pred_bev': c, 'pred_dim': d, 'pred_angle': e, 'pred_depth_bin': f, 'pred_depth_delta': g}
+                for a, b, c, d, e, f, g in zip(outputs_class[:-1], outputs_coord[:-1], outputs_bev[:-1], outputs_dim[:-1], outputs_angle[:-1], output_depth_bin[:-1], output_depth_delta[:-1])]
 
 
 class SetCriterion(nn.Module):
@@ -96,7 +126,7 @@ class SetCriterion(nn.Module):
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
-    def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses):
+    def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses, n_depth_bins = None, depth_bin_res = None):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -114,6 +144,8 @@ class SetCriterion(nn.Module):
         empty_weight = torch.ones(self.num_classes + 1)
         empty_weight[-1] = self.eos_coef
         self.register_buffer('empty_weight', empty_weight)
+        self.n_depth_bins = n_depth_bins
+        self.depth_bin_res = depth_bin_res
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (NLL)
@@ -134,6 +166,32 @@ class SetCriterion(nn.Module):
         if log:
             # TODO this should probably be a separate loss, not hacked in this one here
             losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
+        return losses
+
+    def loss_depth_multi_bin(self, outputs, targets, indices, num_boxes):
+        """Classification loss (NLL)
+        targets dicts must contain the key "depth" containing a tensor of dim [nb_target_boxes]
+        """
+        assert 'pred_depth_bin' in outputs
+        assert 'pred_depth_delta' in outputs
+        idx = self._get_src_permutation_idx(indices)
+
+        src_depth_bin = outputs['pred_depth_bin'][idx].squeeze()
+        src_depth_delta = outputs['pred_depth_delta'][idx].squeeze()
+
+        target_depth = torch.cat([t['depth'][i] for t, (_, i) in zip(targets, indices)])
+        target_depth_bin_cls = target_depth/self.depth_bin_res
+        target_depth_bin_cls = target_depth_bin_cls.int()
+        target_depth_delta = target_depth - target_depth_bin_cls*self.depth_bin_res - self.depth_bin_res/2
+        target_depth_bin = torch.zeros_like(src_depth_bin)
+        target_depth_bin[torch.arange(src_depth_bin.size()[0]),target_depth_bin_cls.long()] = 1
+
+        loss_depth_reg = F.mse_loss(src_depth_delta, target_depth_delta)
+        loss_depth_class = F.cross_entropy(src_depth_bin, target_depth_bin)
+        # TODO - confirm the formula
+        loss = loss_depth_reg/2 + loss_depth_class/2
+        losses = {}
+        losses['loss_depth'] = loss
         return losses
 
     @torch.no_grad()
@@ -209,6 +267,26 @@ class SetCriterion(nn.Module):
         losses = {}
         losses['loss_bev'] = loss.sum() / num_boxes
         return losses
+    
+    # def loss_head(self, outputs, targets, indices, num_boxes):
+    #     assert 'pred_head_bev' in outputs
+    #     idx = self._get_src_permutation_idx(indices)
+    #     src_bev = outputs['pred_head_bev'][idx].squeeze()
+    #     target_bev = torch.cat([t['bev'][i] for t, (_, i) in zip(targets, indices)])
+    #     loss = F.l1_loss(src_bev, target_bev, reduction='none')
+    #     losses = {}
+    #     losses['loss_head_bev'] = loss.sum() / num_boxes
+    #     return losses
+
+    # def loss_feet(self, outputs, targets, indices, num_boxes):
+    #     assert 'pred_feet_bev' in outputs
+    #     idx = self._get_src_permutation_idx(indices)
+    #     src_bev = outputs['pred_feet_bev'][idx].squeeze()
+    #     target_bev = torch.cat([t['bev'][i] for t, (_, i) in zip(targets, indices)])
+    #     loss = F.l1_loss(src_bev, target_bev, reduction='none')
+    #     losses = {}
+    #     losses['loss_feet_bev'] = loss.sum() / num_boxes
+    #     return losses
 
     def loss_dims(self, outputs, targets, indices, num_boxes):
         assert 'pred_dim' in outputs
@@ -287,7 +365,10 @@ class SetCriterion(nn.Module):
             'masks': self.loss_masks,
             'bev': self.loss_bev,
             'dim': self.loss_dims,
-            'angle': self.loss_angles
+            'angle': self.loss_angles,
+            'depth': self.loss_depth_multi_bin
+            # 'head': self.loss_head,
+            # 'feet': self.loss_feet
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -403,6 +484,9 @@ def build(args):
     transformer = build_transformer(args)
     transformer_BEV = build_transformer_BEV(args)
 
+    n_depth_bins = args.num_depth_bins # 9
+    depth_bin_res = args.depth_bin_res # 10
+
     model = DETR(
         backbone,
         transformer,
@@ -410,6 +494,7 @@ def build(args):
         num_classes=num_classes,
         num_queries=args.num_queries,
         aux_loss=args.aux_loss,
+        n_depth_bins = n_depth_bins
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
@@ -419,6 +504,9 @@ def build(args):
     weight_dict['loss_bev'] = args.bev_loss_coef
     weight_dict['loss_dim'] = args.dim_loss_coef
     weight_dict['loss_angle'] = args.angle_loss_coef
+    weight_dict['loss_depth'] = args.depth_loss_coef
+    # weight_dict['loss_head_bev'] = args.head_loss_coef
+    # weight_dict['loss_feet_bev'] = args.feet_loss_coef
     if args.masks:
         weight_dict["loss_mask"] = args.mask_loss_coef
         weight_dict["loss_dice"] = args.dice_loss_coef
@@ -429,11 +517,13 @@ def build(args):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    losses = ['labels', 'boxes', 'cardinality', 'bev', 'dim', 'angle']
+    losses = ['labels', 'boxes', 'cardinality', 'bev', 'dim', 'angle', 'depth']
+    # losses = ['bev', 'dim', 'angle']
+
     if args.masks:
         losses += ["masks"]
     criterion = SetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict,
-                             eos_coef=args.eos_coef, losses=losses)
+                             eos_coef=args.eos_coef, losses=losses, n_depth_bins = n_depth_bins, depth_bin_res = depth_bin_res)
     criterion.to(device)
     postprocessors = {'bbox': PostProcess()}
     if args.masks:

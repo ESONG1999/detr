@@ -25,12 +25,23 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
 
-    for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
+    for samples, targets, calibs in metric_logger.log_every(data_loader, print_freq, header):
+        # calib_M = calib_M.to(device)
+        # print(len(calibs))
+        l = len(calibs)
+        if l == 1:
+            calib = calibs[0]
+        else:
+            calib = torch.stack((calibs[0],calibs[1]), dim=0)
+        # print(calib.size())
+        # a = calibs + targets
+        calib = calib.to(device)
+
         samples = samples.to(device)
 
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        outputs = model(samples)
+        outputs = model(samples, calib)
 
         # print(image_id)
         # outputs = model(samples, temp)
@@ -99,11 +110,21 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
             output_dir=os.path.join(output_dir, "panoptic_eval"),
         )
 
-    for samples, targets in metric_logger.log_every(data_loader, 10, header):
+    for samples, targets, calibs in metric_logger.log_every(data_loader, 10, header):
+        # calib_M = calib_M.to(device)
+        # print(len(calibs))
+        l = len(calibs)
+        if l == 1:
+            calib = calibs[0]
+        else:
+            calib = torch.stack((calibs[0],calibs[1]), dim=0)
+        # print(calib.size())
+        # a = calibs + targets
+        calib = calib.to(device)
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        outputs = model(samples)
+        outputs = model(samples, calib)
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 

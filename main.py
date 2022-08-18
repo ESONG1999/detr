@@ -112,7 +112,7 @@ def get_args_parser():
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=42, type=int)
     # parser.add_argument('--resume', default='', help='resume from checkpoint')
-    parser.add_argument('--resume', default='pretrained/checkpoint0299.pth', help='resume from checkpoint')
+    parser.add_argument('--resume', default='pretrained/detr-r101-dc5-a2e86def.pth', help='resume from checkpoint')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
@@ -148,14 +148,16 @@ def main(args):
     model, criterion, postprocessors = build_model(args)
     model.to(device)
 
-    for name, param in model.transformer.named_parameters():
-        param.requires_grad = False
+    # Frozen the parameter
     
-    for name, param in model.bbox_embed.named_parameters():
-        param.requires_grad = False
+    # for name, param in model.transformer.named_parameters():
+    #     param.requires_grad = False
     
-    for name, param in model.class_embed.named_parameters():
-        param.requires_grad = False
+    # for name, param in model.bbox_embed.named_parameters():
+    #     param.requires_grad = False
+    
+    # for name, param in model.class_embed.named_parameters():
+    #     param.requires_grad = False
     
     # for name, param in model.depth_delta.named_parameters():
     #     param.requires_grad = False
@@ -221,21 +223,21 @@ def main(args):
             print('loading pretrianed weights.....')
             checkpoint = torch.load(args.resume, map_location='cpu')
         # model_without_ddp.load_state_dict(checkpoint['model'])
-        # del checkpoint["model"]["class_embed.weight"]
-        # del checkpoint["model"]["class_embed.bias"]
+        del checkpoint["model"]["class_embed.weight"]
+        del checkpoint["model"]["class_embed.bias"]
         # Remove box weights
-        # keys_to_delete = []
-        # for key in checkpoint["model"]:
-        #     if 'box_embed' in key:
-        #         print(key)
-        #         keys_to_delete.append(key)
+        keys_to_delete = []
+        for key in checkpoint["model"]:
+            if 'box_embed' in key:
+                print(key)
+                keys_to_delete.append(key)
 
-        # for key in keys_to_delete:
-        #     del checkpoint["model"][key]
+        for key in keys_to_delete:
+            del checkpoint["model"][key]
 
         model_without_ddp.load_state_dict(checkpoint['model'], strict = False)
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
-            # optimizer.load_state_dict(checkpoint['optimizer'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             args.start_epoch = checkpoint['epoch'] + 1
 
